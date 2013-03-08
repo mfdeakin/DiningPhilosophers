@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/shm.h>
 #include <sys/sem.h>
+#include <signal.h>
 #include <unistd.h>
 
 #define NUMPHILOSOPHERS 5
@@ -55,6 +56,11 @@ void p(int semaphore, int num);
 void v(int semaphore, int num);
 #define up v
 
+void ctrlc(int sig);
+
+/* So we can catch and cleanup CTRL-C's */
+struct philosophers *phil;
+
 int main(int argc, char **argv)
 {
 	/* Allow the user to optionally specify how many philosophers
@@ -62,6 +68,7 @@ int main(int argc, char **argv)
 	 */
 	int n = NUMPHILOSOPHERS,
 		t = TIMELIMIT;
+	signal(SIGINT, ctrlc);
 	if(argc > 1) {
 		int chk = sscanf(argv[1], "%d", &n);
 		if(chk == 0)
@@ -72,10 +79,10 @@ int main(int argc, char **argv)
 				t = TIMELIMIT;
 		}
 	}
-	struct philosophers *ph = initPhilosophers(n, t);
+	phil = initPhilosophers(n, t);
 	if(fork() == 0) {
 		/* Child process, runs simulation */
-		simulate(ph);
+		simulate(phil);
 	}
 	else {
 		/* Used to map states to strings */
@@ -89,41 +96,78 @@ int main(int argc, char **argv)
 		 * unless it's finished, and we don't care if we run an extra time.
 		 * The other stuff is safe because it's never set to an invalid state
 		 */
-		while(ph->running > 0) {
+		while(phil->running > 0) {
 			printf("%d.\t", runcount);
-			for(int i = 0; i < ph->count; i++) {
-				printf("\t%8s", statestr[ph->state[i]]);
+			for(int i = 0; i < phil->count; i++) {
+				printf("\t%8s", statestr[phil->state[i]]);
 			}
 			printf("\n");
 			runcount++;
 			sleep(1);
 		}
-		freePhilosophers(ph);
+		freePhilosophers(phil);
 	}
 	return 0;
+}
+
+/* Cleanup and get out of Dodge */
+void ctrlc(int sig)
+{
+	p(phil->runmtx, 0);
+	phil->running--;
+	/* We're the last one, so clean up! */
+	if(phil->running == -1) {
+		freePhilosophers(phil);
+	}
+	else {
+		v(phil->runmtx, 0);
+	}
+	exit(0);
 }
 
 struct philosophers *initPhilosophers(int count, int timelimit)
 {
 	size_t size = sizeof(struct philosophers) + sizeof(enum states[count]);
 	int shmid = shmget(IPC_PRIVATE, size, 0660);
+	if(!shmid) {
+		fprintf(stderr, "Could not open shared memory!\n");
+		exit(1);
+	}
 	struct philosophers *ph = shmat(shmid, NULL, 0);
 	memset(ph, 0, sizeof(*ph));
 	ph->count = count;
 	ph->shmid = shmid;
 	ph->running = ph->count;
-	ph->runmtx = getsem(1, 1);
-	ph->testmtx = getsem(1, 1);
-	ph->statemtx = getsem(ph->count, 0);
 	ph->maxtime = time(NULL) + timelimit;
+	ph->runmtx = getsem(1, 1);
+	if(ph->runmtx == -1) {
+		fprintf(stderr, "Could not allocate run mutex!\n");
+		freePhilosophers(ph);
+		exit(1);
+	}
+	ph->testmtx = getsem(1, 1);
+	if(ph->testmtx == -1) {
+		fprintf(stderr, "Could not allocate test mutex!\n");
+		freePhilosophers(ph);
+		exit(1);
+	}
+	ph->statemtx = getsem(ph->count, 0);
+	if(ph->statemtx == -1) {
+		fprintf(stderr, "Could not allocate state mutex!\n");
+		freePhilosophers(ph);
+		exit(1);
+	}
 	return ph;
 }
 
 void freePhilosophers(struct philosophers *ph)
 {
-	semctl(ph->runmtx, 0, IPC_RMID);
-	semctl(ph->testmtx, 0, IPC_RMID);
-	semctl(ph->statemtx, 0, IPC_RMID);
+	if(ph->runmtx != -1)
+		semctl(ph->runmtx, 0, IPC_RMID);
+	if(ph->testmtx != -1)
+		semctl(ph->testmtx, 0, IPC_RMID);
+	if(ph->statemtx != -1)
+		semctl(ph->statemtx, 0, IPC_RMID);
 	shmctl(ph->shmid, IPC_RMID, NULL);
 	shmdt(ph);
 }
@@ -139,12 +183,14 @@ void simulate(struct philosophers *ph)
 			id++);
 	/* Initialize the RNG here so that each philosopher has it's own seed */
 	srand(time(NULL) + id);
+	/* Begin the philosophers routine */
 	while(time(NULL) < ph->maxtime) {
 		think();
 		takeForks(ph, id);
 		eat();
 		putForks(ph, id);
 	}
+	/* Let the main process know there's one less process to worry about */
 	p(ph->runmtx, 0);
 	ph->running--;
 	v(ph->runmtx, 0);
@@ -191,18 +237,12 @@ int right(struct philosophers *ph, int id)
 
 void think(void)
 {
-	int len = rand() % 11 + 5;
-	assert(len <= 15);
-	assert(len >= 5);
-	sleep(len);
+	sleep(rand() % 11 + 5);
 }
 
 void eat(void)
 {
-	int len = rand() % 3 + 1;
-	assert(len >= 1);
-	assert(len <= 3);
-	sleep(len);
+	sleep(rand() % 3 + 1);
 }
 
 /* Locks the critical section */
@@ -235,11 +275,9 @@ void v(int semaphore, int num)
 int getsem(int count, int initial)
 {
 	int semid = semget(IPC_PRIVATE, count, 0777);
-	if(semid == -1) {
-		fprintf(stderr, "Could not open shared memory!\n");
-		exit(1);
+	if(semid != -1) {
+		for(int i = 0; i < count; i++)
+			semctl(semid, i, SETVAL, initial);
 	}
-	for(int i = 0; i < count; i++)
-		semctl(semid, i, SETVAL, initial);
 	return semid;
 }
